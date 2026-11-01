@@ -30,7 +30,9 @@ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot.selfdrive.selfdrived.parking import apply_parking_interlock, parking_interlock_enabled
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
-from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
+from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import (
+  IntelligentCruiseButtonManagement, planner_data_valid,
+)
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
@@ -520,7 +522,8 @@ class SelfdriveD:
         self.params.put('LongitudinalPersonality', self.personality)
         self.events.add(EventName.personalityChanged)
 
-    self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric)
+    self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric,
+                  self.sm['longitudinalPlan'], plan_valid=planner_data_valid(self.sm, time.monotonic()))
 
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
