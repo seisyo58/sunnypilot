@@ -23,7 +23,12 @@ SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 ALLOWED_SPEED_THRESHOLD = 1.8  # m/s, ~4 MPH
 HYST_GAP = 0.0  # currently disabled; TODO-SP: might need to be brand-specific
 INACTIVE_TIMER = 0.4
-PLANNER_LOOKAHEAD = 3.0  # s; convert requested acceleration to an OEM set-speed cap
+PLANNER_GAIN = 1.0  # acceleration error -> set-speed adjustment rate
+PLANNER_MAX_LOWER_RATE = 2.0  # m/s of set speed per second
+PLANNER_RECOVERY_RATE = 0.5  # m/s of set speed per second
+PLANNER_ACCEL_DEADBAND = 0.15  # m/s²
+PLANNER_MAX_PENDING_DROP = 2.0 / 3.6  # at most 2 km/h below OEM acknowledgement
+PLANNER_RELEASE_THRESHOLD = -0.1  # hysteresis after entering at -0.3
 PLANNER_DECEL_THRESHOLD = -0.3  # m/s²; ignore very small deceleration requests
 PLAN_MAX_AGE = 0.25  # s
 
@@ -59,6 +64,8 @@ class IntelligentCruiseButtonManagement:
     self.is_metric = False
 
     self.cruise_button_timers = CRUISE_BUTTON_TIMER.copy()
+    self.planner_cap = None
+    self.planner_decelerating = False
     self.use_planner = CP.carFingerprint in (NISSAN.NISSAN_LEAF, NISSAN.NISSAN_LEAF_IC) and not CP.openpilotLongitudinalControl
 
   @property
@@ -71,10 +78,33 @@ class IntelligentCruiseButtonManagement:
     ms_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
 
     target = LP_SP.vTarget
-    if self.use_planner and plan is not None and plan.aTarget <= PLANNER_DECEL_THRESHOLD:
+    if self.use_planner and plan is not None:
       minimum = get_minimum_set_speed(self.is_metric) * ms_conv
-      planner_target = max(minimum, CS.vEgo + plan.aTarget * PLANNER_LOOKAHEAD)
-      target = min(target, planner_target)
+      cluster = CS.cruiseState.speedCluster
+      if plan.aTarget <= PLANNER_DECEL_THRESHOLD:
+        self.planner_decelerating = True
+      elif plan.aTarget >= PLANNER_RELEASE_THRESHOLD:
+        self.planner_decelerating = False
+      if self.planner_decelerating:
+        if self.planner_cap is None:
+          self.planner_cap = max(minimum, min(target, cluster))
+        error = plan.aTarget - CS.aEgo
+        if error < -PLANNER_ACCEL_DEADBAND:
+          self.planner_cap -= min(-error * PLANNER_GAIN, PLANNER_MAX_LOWER_RATE) * DT_CTRL
+          # Wait for the OEM setpoint to respond before asking for more.
+          self.planner_cap = max(self.planner_cap, cluster - PLANNER_MAX_PENDING_DROP)
+        else:
+          # Already braking enough: cancel any remaining downward target.
+          self.planner_cap = max(self.planner_cap, cluster)
+          if error > PLANNER_ACCEL_DEADBAND:
+            self.planner_cap += min(error * PLANNER_GAIN, PLANNER_RECOVERY_RATE) * DT_CTRL
+      elif self.planner_cap is not None:
+        self.planner_cap += PLANNER_RECOVERY_RATE * DT_CTRL
+        if self.planner_cap >= target:
+          self.planner_cap = None
+      if self.planner_cap is not None:
+        self.planner_cap = max(minimum, self.planner_cap)
+        target = min(target, self.planner_cap)
     self.v_target_ms_last = apply_hysteresis(target, self.v_target_ms_last, HYST_GAP * ms_conv)
 
     self.v_target = round(self.v_target_ms_last * speed_conv)
@@ -146,8 +176,12 @@ class IntelligentCruiseButtonManagement:
     if self.use_planner:
       # A missing/stale plan must not restore the higher cruise target or send RES.
       self.is_ready &= (plan_valid and plan is not None and math.isfinite(plan.aTarget) and
-                        math.isfinite(LP_SP.vTarget) and math.isfinite(CS.vEgo) and
+                        math.isfinite(LP_SP.vTarget) and math.isfinite(CS.vEgo) and math.isfinite(CS.aEgo) and
+                        math.isfinite(CS.cruiseState.speedCluster) and
                         not CS.brakePressed and not CS.gasPressed and CS.cruiseState.enabled)
+    if self.use_planner and not self.is_ready:
+      self.planner_cap = None
+      self.planner_decelerating = False
     if not self.use_planner or self.is_ready:
       self.update_calculations(CS, LP_SP, plan)
 

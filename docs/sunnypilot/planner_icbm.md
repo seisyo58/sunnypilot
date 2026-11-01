@@ -7,52 +7,55 @@ The stopped-lead advisory is a separate branch and is not included here.
 
 ## Target selection
 
-ICBM now reads longitudinalPlan.aTarget, the planner's final acceleration
-selection (AI/e2e, lead MPC, or cruise). For aTarget <= -0.3 m/s²:
+ICBM reads longitudinalPlan.aTarget, the final acceleration selection from
+AI/e2e, lead MPC, or cruise. Enter planner deceleration at <= -0.3 m/s² and
+release at >= -0.1 m/s² to avoid switching at a single threshold.
 
-    planner_cap = max(OEM_minimum, vEgo + aTarget * 3 seconds)
-    ICBM_target = min(longitudinalPlanSP.vTarget, planner_cap)
+The previous vEgo + aTarget * 3s conversion has been removed. Instead a
+persistent set-speed cap starts at the acknowledged OEM setting (bounded by
+the existing SP target). Compare aTarget with measured carState.aEgo:
 
-The horizon is a provisional conversion to a set-speed cap, not a prediction
-that the OEM ACC will achieve the requested acceleration. Targets use existing
-metric/imperial rounding and minima (30 km/h or 20 mph).
+- If braking is insufficient by more than 0.15 m/s², lower the cap at a rate
+  proportional to the acceleration error, limited to 2 m/s per second.
+- Never request more than 2 km/h below the acknowledged OEM setting while
+  waiting for its response. OEM button steps can still overshoot this target.
+- If already braking enough, raise the cap to at least the current OEM setting
+  to stop further downward button requests. Excess braking allows gradual
+  upward correction, limited to 0.5 m/s per second.
+- After the deceleration request clears, release the cap at 0.5 m/s per second
+  rather than jumping straight back to the user target.
 
-Existing vision/map curve and speed-limit reductions remain upper bounds.
-AI deceleration on a curve can further reduce the target, but does not replace
-curvature-based speed selection. On request release the existing ICBM state
-machine can increase toward the user's existing cruise/curve/limit target.
+The final target is the lower of this cap and longitudinalPlanSP.vTarget.
+Existing curve/map/speed-limit targets can still lower it immediately; the
+recovery rate only constrains the planner cap. Existing units/minima remain
+30 km/h or 20 mph. These gains and thresholds are provisional, not a calibrated
+model of OEM ACC response. Acceleration sensor delay, quantized buttons and
+vehicle dynamics still affect tracking; this is not direct acceleration control.
 
-Both plan messages must pass message checks and have timestamps no older than
-0.25 seconds; the source model timestamp in longitudinalPlan must also be fresh.
-Invalid/nonfinite input inhibits all ICBM button requests, including increases,
-instead of falling back to the higher cruise target. Recovery uses the existing
-0.4-second activation delay. Brake/gas, cruise disengagement, cancel/override/
-resume, and manual cruise buttons inhibit planner-connected ICBM. The existing
-Nissan controller and Panda still enforce PPP and cancellation constraints.
+Both plan messages and the source model must be fresh within 0.25 seconds.
+Invalid/nonfinite inputs, driver operations and disengagement stop output and
+reset cap state. Recovery uses the existing 0.4-second activation delay.
+No changes to Nissan CAN transmission or PPP interlocks.
 
 Cruise button timing helpers were moved to a lightweight shared module so
 controller tests do not require native Params libraries. ICBM timer dictionaries
 are now private to each instance.
 
-## Validation (2026-11-01)
+## Validation (2026-11-01 feedback revision)
 
-Offline replay of route 00000052--e778adf53f segment 20 first requests decrease
-near 2026-10-31 21:48:24.89 JST: recorded speed 40.7 km/h, requested acceleration
--0.301 m/s², existing target 45 km/h, new rounded target 37 km/h. The old path
-requests no button at that instant. This precedes the recorded brake signal
-by about 3.6 seconds. No CAN is sent by replay.
+46 tests and 9 subtests passed, including existing parking/PPP tests.
+New checks cover sufficient actual deceleration, falling ego speed without a
+falling set-speed target, bounded pending reductions, release rate and threshold
+hysteresis. Existing tests cover driver priority, invalid/stale input, platform
+scope, curve bounds and units/minima. Ruff and diff checks passed.
 
-Segments 10, 20 and 21 were replayed independently. No decrease requests were
-observed while the recorded brake was pressed or cruise was disabled. Segment
-10 also exercises the existing curve-target reduction. Replay uses recorded
-OEM speeds/setpoints and cannot simulate how the vehicle responds to new
-buttons. Freshness checks use log timestamps; offline replay does not simulate
-SubMaster frequency health or process scheduling.
-
-Tests cover target selection, existing curve bounds, units/minima, driver
-priority, missing/stale/invalid plans, restoration, platform gating, and source
-freshness. Nissan parking/PPP tests are included. Device build/runtime and
-actual deceleration response remain unverified. This is not emergency braking.
+Offline comparisons used route 00000053--44ff2a74c1 segments 7 and 8 with identical
+recorded inputs. At monotonic 1299.8s the old target was 30 km/h and the new target
+42 km/h; at 1361.8s the old target was 38 km/h and the new target 54 km/h.
+No CAN is sent by replay. Vehicle acceleration/setpoint feedback comes from the
+old implementation's recorded drive, so this is not a closed-loop simulation
+or evidence of improved real vehicle behavior. Device deployment and real
+response of this revision remain unverified.
 
 ```sh
 PYTHONPATH=.:opendbc_repo:msgq_repo .venv/bin/python -m pytest -q \
